@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib import parse, request
+from urllib import error, parse, request
 
 
 # ============================================================
@@ -17,15 +17,30 @@ INSTRUCTIONS_FILE = BASE_DIR / "instructions.txt"
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Default Groq model.
-# No GitHub Secret is required for this.
-DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+# Fixed model.
+# No GROQ_MODEL secret is required.
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Groq Free Tier has a relatively small token-per-minute limit.
+# We intentionally keep requests conservative.
+SAFE_TOTAL_TOKENS = 7200
+
+# Maximum visible + reasoning completion tokens.
+INITIAL_MAX_COMPLETION_TOKENS = 4000
+
+# Never allow generation to become ridiculously short.
+MIN_COMPLETION_TOKENS = 1800
+
+# Number of retries for temporary API problems.
+MAX_GROQ_RETRIES = 4
 
 # Telegram message limit.
-# We use 4000 instead of 4096 to leave a safety margin.
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000
 
-# Delay between Telegram messages.
+# Telegram retry count.
+MAX_TELEGRAM_RETRIES = 4
+
+# Delay between Telegram chunks.
 TELEGRAM_MESSAGE_DELAY = 0.5
 
 
@@ -45,16 +60,11 @@ def log(message: str) -> None:
 
 
 # ============================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # ============================================================
 
 def get_required_env(name: str) -> str:
-    """
-    Get a required environment variable.
-
-    Stops execution with a clear error if the variable
-    is missing or empty.
-    """
+    """Get a required environment variable."""
 
     value = os.getenv(name)
 
@@ -72,7 +82,7 @@ def get_required_env(name: str) -> str:
 # ============================================================
 
 def read_instructions() -> str:
-    """Read instructions.txt from the repository."""
+    """Read instructions.txt."""
 
     if not INSTRUCTIONS_FILE.exists():
         raise FileNotFoundError(
@@ -92,158 +102,162 @@ def read_instructions() -> str:
 
 
 # ============================================================
-# TEXT PROCESSING
+# TOKEN ESTIMATION
 # ============================================================
 
-def split_message(
-    text: str,
-    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH
-) -> list[str]:
+def estimate_tokens(text: str) -> int:
     """
-    Split long text into Telegram-compatible messages.
+    Rough token estimation.
 
-    The function tries to preserve paragraphs and lines
-    before falling back to a hard split.
+    For mixed Russian/English text, characters / 4 is a
+    reasonable conservative approximation for this use case.
     """
-
-    text = text.strip()
 
     if not text:
-        return []
+        return 0
 
-    if len(text) <= max_length:
-        return [text]
-
-    chunks = []
-    current = ""
-
-    paragraphs = text.split("\n\n")
-
-    for paragraph in paragraphs:
-
-        paragraph = paragraph.strip()
-
-        if not paragraph:
-            continue
-
-        # Paragraph fits into current chunk.
-        candidate = (
-            paragraph
-            if not current
-            else current + "\n\n" + paragraph
-        )
-
-        if len(candidate) <= max_length:
-            current = candidate
-            continue
-
-        # Save current chunk.
-        if current:
-            chunks.append(current)
-            current = ""
-
-        # Paragraph itself is too large.
-        if len(paragraph) > max_length:
-
-            lines = paragraph.split("\n")
-
-            for line in lines:
-
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                # Single line is too long.
-                if len(line) > max_length:
-
-                    # Save current chunk first.
-                    if current:
-                        chunks.append(current)
-                        current = ""
-
-                    # Hard split the long line.
-                    for i in range(
-                        0,
-                        len(line),
-                        max_length
-                    ):
-                        chunks.append(
-                            line[i:i + max_length]
-                        )
-
-                else:
-
-                    if not current:
-                        current = line
-
-                    elif len(current) + 1 + len(line) <= max_length:
-                        current += "\n" + line
-
-                    else:
-                        chunks.append(current)
-                        current = line
-
-        else:
-            current = paragraph
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+    return max(
+        1,
+        len(text) // 4
+    )
 
 
-# ============================================================
-# GROQ API
-# ============================================================
-
-def generate_script(
-    api_key: str,
+def calculate_max_completion_tokens(
     instructions: str
+) -> int:
+    """
+    Calculate a safe completion size.
+
+    Keeps input + output comfortably below the conservative
+    Groq Free Tier token budget.
+    """
+
+    estimated_input_tokens = (
+        estimate_tokens(instructions)
+        + 350
+    )
+
+    available = (
+        SAFE_TOTAL_TOKENS
+        - estimated_input_tokens
+    )
+
+    calculated = min(
+        INITIAL_MAX_COMPLETION_TOKENS,
+        available
+    )
+
+    calculated = max(
+        MIN_COMPLETION_TOKENS,
+        calculated
+    )
+
+    log(
+        "Estimated input tokens: "
+        f"{estimated_input_tokens}"
+    )
+
+    log(
+        "Max completion tokens: "
+        f"{calculated}"
+    )
+
+    return calculated
+
+
+# ============================================================
+# GROQ ERROR HELPERS
+# ============================================================
+
+def extract_http_error(
+    exc: error.HTTPError
+) -> tuple[int, str]:
+    """Read status code and response body from HTTPError."""
+
+    status = exc.code
+
+    try:
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+    except Exception:
+        body = ""
+
+    return status, body
+
+
+def parse_error_message(body: str) -> str:
+    """Extract a readable API error message."""
+
+    if not body:
+        return "No response body."
+
+    try:
+        data = json.loads(body)
+
+        if isinstance(data, dict):
+
+            err = data.get("error")
+
+            if isinstance(err, dict):
+                return err.get(
+                    "message",
+                    json.dumps(err, ensure_ascii=False)
+                )
+
+            if isinstance(err, str):
+                return err
+
+    except json.JSONDecodeError:
+        pass
+
+    return body[:1000]
+
+
+# ============================================================
+# GROQ REQUEST
+# ============================================================
+
+def make_groq_request(
+    api_key: str,
+    instructions: str,
+    max_completion_tokens: int
 ) -> str:
     """
-    Generate the daily script using Groq.
+    Make one Groq request.
 
-    The model is intentionally hardcoded as a default
-    so no GROQ_MODEL GitHub Secret is required.
+    Raises HTTPError when Groq rejects the request.
     """
-
-    model = DEFAULT_GROQ_MODEL
 
     today = datetime.now().strftime("%d.%m.%Y")
 
     user_prompt = f"""
 Сегодня {today}.
 
-Подготовь сегодняшний сценарий на основе системных инструкций.
+Создай сегодняшний готовый сценарий строго по системным
+инструкциям.
 
-КРИТИЧЕСКИ ВАЖНО:
+КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
 
-1. Верни только готовый сценарий.
-2. Не объясняй процесс создания сценария.
-3. Не пиши мета-комментарии.
-4. Не выдавай список идей вместо полноценного сценария.
-5. Сценарий должен быть полностью готов для дальнейшего использования.
-6. Соблюдай ВСЕ требования из системных инструкций.
-7. Если в инструкциях указаны требования к структуре,
-   длине, стилю, хуку, фактам, CTA, повествованию
-   или оформлению — соблюдай их.
-8. Пиши естественно и живо.
-9. Избегай шаблонных фраз и ощущения текста,
-   написанного нейросетью.
-10. Не придумывай конкретные факты, цифры, события,
-    цитаты или статистику, если это не разрешено
-    системными инструкциями.
-11. Сделай сценарий максимально сильным с точки зрения
-    удержания внимания.
-12. Не добавляй вступление вроде "Вот ваш сценарий".
-13. Не добавляй заключительные комментарии после сценария.
+- Верни только финальный сценарий.
+- Не объясняй процесс создания.
+- Не добавляй мета-комментарии.
+- Не выдавай список идей вместо сценария.
+- Соблюдай все требования из instructions.txt.
+- Сценарий должен быть полностью готов к использованию.
+- Пиши естественно, живо и профессионально.
+- Не придумывай конкретные факты, цифры, события или
+  статистику, если это не разрешено инструкциями.
+- Не добавляй фразу "Вот ваш сценарий".
+- Не добавляй комментарии после сценария.
 
-Ответ должен содержать ТОЛЬКО финальный сценарий.
+Ответ должен содержать ТОЛЬКО сценарий.
 """.strip()
 
     payload = {
-        "model": model,
+        "model": GROQ_MODEL,
+
         "messages": [
             {
                 "role": "system",
@@ -254,14 +268,31 @@ def generate_script(
                 "content": user_prompt
             }
         ],
+
         "temperature": 0.7,
-        "max_completion_tokens": 12000
+
+        "max_completion_tokens": max_completion_tokens,
+
+        # GPT-OSS supports low / medium / high.
+        # Low is enough for a script-generation task and
+        # helps keep token usage predictable.
+        "reasoning_effort": "low"
     }
 
     data = json.dumps(
         payload,
-        ensure_ascii=False
+        ensure_ascii=False,
+        separators=(",", ":")
     ).encode("utf-8")
+
+    log(
+        f"Sending request to Groq using model: "
+        f"{GROQ_MODEL}"
+    )
+
+    log(
+        f"Request body size: {len(data)} bytes"
+    )
 
     req = request.Request(
         GROQ_API_URL,
@@ -269,34 +300,23 @@ def generate_script(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "daily-script-generator/1.0"
+            "Accept": "application/json",
+            "User-Agent": "daily-script-generator/2.0"
         },
         method="POST"
     )
 
-    log(
-        f"Sending request to Groq using model: {model}"
-    )
+    with request.urlopen(
+        req,
+        timeout=180
+    ) as response:
+
+        raw_response = response.read().decode(
+            "utf-8",
+            errors="replace"
+        )
 
     try:
-
-        with request.urlopen(
-            req,
-            timeout=180
-        ) as response:
-
-            raw_response = response.read().decode(
-                "utf-8"
-            )
-
-    except Exception as exc:
-
-        raise RuntimeError(
-            f"Groq API request failed: {exc}"
-        ) from exc
-
-    try:
-
         result = json.loads(raw_response)
 
     except json.JSONDecodeError as exc:
@@ -305,20 +325,11 @@ def generate_script(
             "Groq returned invalid JSON."
         ) from exc
 
-    # Handle Groq API errors.
     if "error" in result:
 
-        error = result["error"]
-
-        if isinstance(error, dict):
-
-            message = error.get(
-                "message",
-                str(error)
-            )
-
-        else:
-            message = str(error)
+        message = parse_error_message(
+            raw_response
+        )
 
         raise RuntimeError(
             f"Groq API error: {message}"
@@ -326,7 +337,10 @@ def generate_script(
 
     try:
 
-        content = result["choices"][0]["message"]["content"]
+        content = (
+            result["choices"][0]
+            ["message"]["content"]
+        )
 
     except (
         KeyError,
@@ -349,15 +363,357 @@ def generate_script(
 
 
 # ============================================================
-# TELEGRAM API
+# GROQ WITH RETRIES / FALLBACKS
 # ============================================================
+
+def generate_script(
+    api_key: str,
+    instructions: str
+) -> str:
+
+    max_completion_tokens = (
+        calculate_max_completion_tokens(
+            instructions
+        )
+    )
+
+    # Fallback sizes for 413 / oversized requests.
+    fallback_sizes = [
+        max_completion_tokens,
+        3500,
+        3000,
+        2500,
+        2000,
+    ]
+
+    # Remove duplicates and keep values >= minimum.
+    sizes = []
+
+    for value in fallback_sizes:
+
+        value = max(
+            MIN_COMPLETION_TOKENS,
+            value
+        )
+
+        if value not in sizes:
+            sizes.append(value)
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        MAX_GROQ_RETRIES + 1
+    ):
+
+        current_size = sizes[
+            min(
+                attempt - 1,
+                len(sizes) - 1
+            )
+        ]
+
+        log(
+            f"Groq attempt "
+            f"{attempt}/{MAX_GROQ_RETRIES} "
+            f"with max_completion_tokens="
+            f"{current_size}"
+        )
+
+        try:
+
+            return make_groq_request(
+                api_key=api_key,
+                instructions=instructions,
+                max_completion_tokens=current_size
+            )
+
+        except error.HTTPError as exc:
+
+            status, body = extract_http_error(
+                exc
+            )
+
+            message = parse_error_message(
+                body
+            )
+
+            last_error = (
+                f"HTTP {status}: {message}"
+            )
+
+            # ------------------------------------------------
+            # 413 — Payload Too Large
+            # ------------------------------------------------
+
+            if status == 413:
+
+                log(
+                    "Groq returned HTTP 413 "
+                    "(Payload Too Large)."
+                )
+
+                if attempt < MAX_GROQ_RETRIES:
+
+                    log(
+                        "Reducing completion size "
+                        "and retrying..."
+                    )
+
+                    time.sleep(1)
+
+                    continue
+
+                break
+
+            # ------------------------------------------------
+            # 429 — Rate limit
+            # ------------------------------------------------
+
+            if status == 429:
+
+                retry_after = (
+                    exc.headers.get(
+                        "Retry-After"
+                    )
+                    if exc.headers
+                    else None
+                )
+
+                try:
+                    wait_seconds = int(
+                        retry_after
+                    )
+                except (
+                    TypeError,
+                    ValueError
+                ):
+                    wait_seconds = 10
+
+                wait_seconds = min(
+                    max(wait_seconds, 3),
+                    60
+                )
+
+                log(
+                    f"Groq rate limit reached. "
+                    f"Waiting {wait_seconds}s..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Temporary server errors
+            # ------------------------------------------------
+
+            if status in {
+                500,
+                502,
+                503,
+                504
+            }:
+
+                wait_seconds = min(
+                    2 ** attempt,
+                    30
+                )
+
+                log(
+                    f"Temporary Groq error "
+                    f"{status}. "
+                    f"Retrying in "
+                    f"{wait_seconds}s..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Permanent client errors
+            # ------------------------------------------------
+
+            raise RuntimeError(
+                f"Groq API returned HTTP "
+                f"{status}: {message}"
+            ) from exc
+
+        except error.URLError as exc:
+
+            last_error = (
+                f"Network error: {exc}"
+            )
+
+            if attempt < MAX_GROQ_RETRIES:
+
+                wait_seconds = min(
+                    2 ** attempt,
+                    30
+                )
+
+                log(
+                    f"Network error. "
+                    f"Retrying in "
+                    f"{wait_seconds}s..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            break
+
+        except TimeoutError as exc:
+
+            last_error = (
+                f"Timeout: {exc}"
+            )
+
+            if attempt < MAX_GROQ_RETRIES:
+
+                time.sleep(
+                    min(2 ** attempt, 30)
+                )
+
+                continue
+
+            break
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                f"Unexpected Groq error: {exc}"
+            ) from exc
+
+    raise RuntimeError(
+        "Groq request failed after all retries. "
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def split_message(
+    text: str,
+    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH
+) -> list[str]:
+    """
+    Split long text into Telegram-compatible chunks.
+    """
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    paragraphs = text.split("\n\n")
+
+    for paragraph in paragraphs:
+
+        paragraph = paragraph.strip()
+
+        if not paragraph:
+            continue
+
+        candidate = (
+            paragraph
+            if not current
+            else current + "\n\n" + paragraph
+        )
+
+        if len(candidate) <= max_length:
+
+            current = candidate
+            continue
+
+        if current:
+
+            chunks.append(current)
+            current = ""
+
+        if len(paragraph) <= max_length:
+
+            current = paragraph
+            continue
+
+        # Long paragraph: split by lines.
+        lines = paragraph.split("\n")
+
+        for line in lines:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if len(line) <= max_length:
+
+                if not current:
+
+                    current = line
+
+                elif (
+                    len(current)
+                    + 1
+                    + len(line)
+                    <= max_length
+                ):
+
+                    current += "\n" + line
+
+                else:
+
+                    chunks.append(current)
+                    current = line
+
+            else:
+
+                if current:
+
+                    chunks.append(current)
+                    current = ""
+
+                # Hard split extremely long lines.
+                for i in range(
+                    0,
+                    len(line),
+                    max_length
+                ):
+
+                    chunks.append(
+                        line[
+                            i:i + max_length
+                        ]
+                    )
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
 
 def send_telegram_message(
     bot_token: str,
     chat_id: str,
     text: str
 ) -> None:
-    """Send one message to Telegram."""
+    """Send one Telegram message."""
 
     url = (
         f"https://api.telegram.org/"
@@ -381,66 +737,157 @@ def send_telegram_message(
             "Content-Type":
                 "application/x-www-form-urlencoded",
             "User-Agent":
-                "daily-script-generator/1.0"
+                "daily-script-generator/2.0"
         },
         method="POST"
     )
 
-    try:
+    last_error = None
 
-        with request.urlopen(
-            req,
-            timeout=60
-        ) as response:
+    for attempt in range(
+        1,
+        MAX_TELEGRAM_RETRIES + 1
+    ):
 
-            raw_response = response.read().decode(
-                "utf-8"
+        try:
+
+            with request.urlopen(
+                req,
+                timeout=60
+            ) as response:
+
+                raw_response = (
+                    response.read()
+                    .decode(
+                        "utf-8",
+                        errors="replace"
+                    )
+                )
+
+            result = json.loads(
+                raw_response
             )
 
-    except Exception as exc:
+            if not result.get("ok"):
 
-        raise RuntimeError(
-            f"Telegram request failed: {exc}"
-        ) from exc
+                description = result.get(
+                    "description",
+                    "Unknown Telegram error"
+                )
 
-    try:
+                raise RuntimeError(
+                    f"Telegram API error: "
+                    f"{description}"
+                )
 
-        result = json.loads(raw_response)
+            return
 
-    except json.JSONDecodeError as exc:
+        except error.HTTPError as exc:
 
-        raise RuntimeError(
-            "Telegram returned invalid JSON."
-        ) from exc
+            status, body = (
+                extract_http_error(exc)
+            )
 
-    if not result.get("ok"):
+            message = parse_error_message(
+                body
+            )
 
-        description = result.get(
-            "description",
-            "Unknown Telegram error"
-        )
+            last_error = (
+                f"HTTP {status}: {message}"
+            )
 
-        raise RuntimeError(
-            f"Telegram API error: {description}"
-        )
+            # Telegram 429 should be retried.
+            if status == 429:
 
+                wait_seconds = 5
 
-# ============================================================
-# SEND FULL SCRIPT
-# ============================================================
+                try:
+
+                    error_data = json.loads(
+                        body
+                    )
+
+                    wait_seconds = int(
+                        error_data
+                        .get("parameters", {})
+                        .get(
+                            "retry_after",
+                            5
+                        )
+                    )
+
+                except Exception:
+                    pass
+
+                wait_seconds = min(
+                    max(wait_seconds, 1),
+                    60
+                )
+
+                log(
+                    f"Telegram rate limit. "
+                    f"Waiting {wait_seconds}s..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+            if status in {
+                500,
+                502,
+                503,
+                504
+            }:
+
+                time.sleep(
+                    min(2 ** attempt, 30)
+                )
+
+                continue
+
+            raise RuntimeError(
+                f"Telegram API returned HTTP "
+                f"{status}: {message}"
+            ) from exc
+
+        except (
+            error.URLError,
+            TimeoutError
+        ) as exc:
+
+            last_error = str(exc)
+
+            if attempt < MAX_TELEGRAM_RETRIES:
+
+                time.sleep(
+                    min(2 ** attempt, 30)
+                )
+
+                continue
+
+    raise RuntimeError(
+        "Telegram request failed after "
+        f"{MAX_TELEGRAM_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
+
 
 def send_script_to_telegram(
     bot_token: str,
     chat_id: str,
     script: str
 ) -> None:
-    """Send the complete generated script to Telegram."""
+    """Send the entire script."""
 
     chunks = split_message(script)
 
     if not chunks:
+
         raise RuntimeError(
-            "Cannot send an empty script to Telegram."
+            "Generated script is empty."
         )
 
     log(
@@ -465,6 +912,7 @@ def send_script_to_telegram(
         )
 
         if index < len(chunks):
+
             time.sleep(
                 TELEGRAM_MESSAGE_DELAY
             )
@@ -481,7 +929,7 @@ def main() -> None:
     log("========================================")
 
     # --------------------------------------------------------
-    # Get secrets
+    # Secrets
     # --------------------------------------------------------
 
     groq_api_key = get_required_env(
@@ -497,7 +945,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Read instructions
+    # Instructions
     # --------------------------------------------------------
 
     log(
@@ -513,7 +961,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Generate script
+    # Generate
     # --------------------------------------------------------
 
     script = generate_script(
@@ -527,7 +975,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Send to Telegram
+    # Telegram
     # --------------------------------------------------------
 
     send_script_to_telegram(
@@ -537,7 +985,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Finish
+    # Done
     # --------------------------------------------------------
 
     log("========================================")
@@ -562,5 +1010,8 @@ if __name__ == "__main__":
 
     except Exception as exc:
 
-        log(f"ERROR: {exc}")
+        log(
+            f"ERROR: {exc}"
+        )
+
         sys.exit(1)
