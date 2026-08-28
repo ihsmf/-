@@ -1,0 +1,33 @@
+name: Daily AI Script
+on:
+  schedule:
+    # Every day at 12:00 Europe/Kyiv
+    - cron: "0 12 * * *"
+      timezone: "Europe/Kyiv"
+  # Allows manual launch from GitHub Actions
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generate-and-send-script:
+    name: Generate and send daily script
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run script generator
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional:
+          # If you don't create this secret,
+          # main.py will use its default model.
+          GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
+        run: |
+          python main.py
